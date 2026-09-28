@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .checker import check_scans
 from .custody import audit_custody
-from .gs1 import ScanParseError, parse_scan
 from .isolation import build_isolation_plan
-from .matcher import match_rules
 from .models import (
     CheckRequest,
     CheckResponse,
@@ -19,17 +18,17 @@ from .models import (
     PackingAuditResponse,
     RuleRelationsRequest,
     RuleRelationsResponse,
-    ScanErrorBody,
-    ScanFields,
-    ScanResult,
+    SignedCheckRequest,
+    SignedCheckResponse,
 )
 from .packing import audit_packing
 from .relations import analyze_rule_relations
+from .signed import check_signed
 
 app = FastAPI(
     title="GS1 扫码核验 API",
-    version="1.4.0",
-    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、规则关系分析、实物交接重放、装拆包装审计与召回隔离计划",
+    version="1.5.0",
+    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、EdDSA 签名核验、规则关系分析、实物交接重放、装拆包装审计与召回隔离计划",
 )
 
 
@@ -41,33 +40,15 @@ def healthz() -> dict[str, str]:
 @app.post("/v1/recall/check", response_model=CheckResponse, tags=["recall"])
 def recall_check(request: CheckRequest) -> CheckResponse:
     """逐条解析扫描串并匹配召回规则;单条解析失败不影响其余条目。"""
-    results: list[ScanResult] = []
-    for index, raw in enumerate(request.scans):
-        try:
-            parsed = parse_scan(raw)
-        except ScanParseError as exc:
-            results.append(
-                ScanResult(
-                    index=index,
-                    ok=False,
-                    error=ScanErrorBody(offset=exc.offset, reason=exc.reason),
-                )
-            )
-            continue
-        results.append(
-            ScanResult(
-                index=index,
-                ok=True,
-                fields=ScanFields(
-                    gtin=parsed.gtin,
-                    batch=parsed.batch,
-                    serial=parsed.serial,
-                    date=parsed.expiry,
-                ),
-                matches=match_rules(parsed, request.rules),
-            )
-        )
-    return CheckResponse(results=results)
+    return CheckResponse(results=check_scans(request.scans, request.rules))
+
+
+@app.post(
+    "/v1/recall/check-signed", response_model=SignedCheckResponse, tags=["recall"]
+)
+def recall_check_signed(request: SignedCheckRequest) -> SignedCheckResponse:
+    """先验 Ed25519 JWS、时间窗与授权 GTIN 前缀,全部通过再执行原扫码核验。"""
+    return check_signed(request)
 
 
 @app.post("/v1/custody/audit", response_model=CustodyAuditResponse, tags=["custody"])

@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from datetime import date as dt_date
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from .gs1 import VARIABLE_MAX, gtin_check_ok
 
@@ -65,6 +73,12 @@ class Rule(BaseModel):
             raise ValueError("date_from 不得晚于 date_to")
         return self
 
+    @classmethod
+    def model_validate_list(cls, raw: list[object]) -> list["Rule"]:
+        """校验规则数组(含 GTIN 模 10、字段约束)并保证规则 ID 唯一。"""
+        rules = TypeAdapter(list[Rule]).validate_python(raw)
+        return _ensure_unique_rule_ids(rules)
+
 
 class CheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -100,6 +114,34 @@ class ScanResult(BaseModel):
 
 class CheckResponse(BaseModel):
     results: list[ScanResult]
+
+
+def _reject_bool(value: object) -> object:
+    # bool 是 int 的子类,pydantic 默认会把 true/false 强转成 1/0,显式拒绝
+    if isinstance(value, bool):
+        raise ValueError("须为整数(Unix 秒),不能为布尔值")
+    return value
+
+
+UnixSeconds = Annotated[int, BeforeValidator(_reject_bool)]
+
+
+class SignedCheckRequest(BaseModel):
+    """/v1/recall/check-signed 请求:现有 scans + compact JWS + 当前 Unix 秒。
+
+    载荷中的 rules、JWS 头部与签名在路由逻辑中校验(分别对应 422 / 403)。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scans: list[str] = Field(min_length=1, max_length=100)
+    jws: str = Field(min_length=1, description="compact JWS(header.payload.signature)")
+    now: UnixSeconds = Field(description="当前时间,Unix 秒")
+
+
+class SignedCheckResponse(BaseModel):
+    kid: str  # 验签通过的头部 kid
+    results: list[ScanResult]  # 与 /v1/recall/check 完全相同的逐条核验结果
 
 
 # ---------- 实物交接审计 (/v1/custody/audit) ----------
