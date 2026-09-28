@@ -4,6 +4,10 @@ services:
     image: gs1-recall-check:latest
     ports:
       - "8000:8000"
+    volumes:
+      # 本地信任文件(只读):公钥 + kid 授权的 GTIN 前缀,不联网取钥。
+      # 路径可用环境变量 GS1_TRUST_FILE 覆盖(容器内默认工作目录下 trust.json)。
+      - ./trust.json:/srv/app/trust.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]

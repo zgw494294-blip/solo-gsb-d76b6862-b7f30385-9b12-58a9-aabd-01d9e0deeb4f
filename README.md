@@ -1,8 +1,9 @@
 # GS1 扫码核验 API
 
-基于 FastAPI 的 GS1 条码解析服务,提供五个接口:
+基于 FastAPI 的 GS1 条码解析服务,提供六个接口:
 
 - **召回核验**:上传一批扫描串和一批召回规则,逐条返回解析出的字段(GTIN / 批号 / 序列号 / 日期)以及命中的规则 ID。
+- **签名召回核验**:上传扫描串、一个 compact JWS(Ed25519 签名,载荷内含召回规则)与当前时间;服务用**本地信任文件**中的公钥验签,校验时间窗与 GTIN 前缀授权后返回 kid 与原扫码核验结果。
 - **召回规则关系分析**:上传 2~100 条召回规则,上线前找出不可能命中任何合法扫描串的规则,以及命中集合有交集的规则对(等价 / 包含 / 部分相交),每对附一条同时命中两者的证据扫描串。
 - **交接审计**:上传一批实物交接事件,按时间重放并审计每件实物(GTIN + 序列号)的持有人流转,返回成功事件与失败原因。
 - **装拆包装审计**:上传一批按顺序执行的装入 / 取出操作,重放并审计实物(GTIN + 序列号)间的直接包装关系,返回涉及实物的直接父件 / 子件 / 最外层容器与失败原因。
@@ -17,6 +18,7 @@ docker compose up --build
 服务监听 **8000** 端口:
 
 - 召回核验:`POST http://localhost:8000/v1/recall/check`
+- 签名召回核验:`POST http://localhost:8000/v1/recall/check-signed`
 - 召回规则关系分析:`POST http://localhost:8000/v1/recall/rule-relations`
 - 交接审计:`POST http://localhost:8000/v1/custody/audit`
 - 装拆包装审计:`POST http://localhost:8000/v1/packing/audit`
@@ -24,11 +26,19 @@ docker compose up --build
 - 交互文档:`http://localhost:8000/docs`
 - 健康检查:`GET http://localhost:8000/healthz`
 
+> 签名核验依赖仓库根目录的本地信任文件 `trust.json`;Compose 已将其只读挂载进容器。本地直接运行 uvicorn 时,在仓库根目录启动即可;也可用环境变量 `GS1_TRUST_FILE` 指向其他路径。
+
 本地开发(无需 Docker):
 
 ```bash
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
+```
+
+生成本地签名样例(信任文件 + JWS,详见下文「本地信任文件与样例脚本」):
+
+```bash
+python scripts/generate_sample_jws.py
 ```
 
 运行测试:
@@ -123,6 +133,106 @@ curl -s http://localhost:8000/v1/recall/check \
 ```
 
 > JSON 中 FNC1 写作 `\u001d`;shell 里也可用 `$'...\x1d...'` 构造。
+
+### `POST /v1/recall/check-signed`
+
+与召回核验语义一致,但规则不在请求体中明文给出,而是放在 **Ed25519 签名的 compact JWS** 载荷里,由服务按本地信任文件验签、校验时间窗与 GTIN 前缀授权后执行核验。**不联网取钥**。
+
+请求体:
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `scans` | `string[]` | 1~100 条扫描串(同召回核验) |
+| `jws` | `string` | compact JWS,三段均为**无填充 base64url**,以两个点分隔 |
+| `now` | `integer` | 当前 Unix 秒(整数;`true` / 浮点 / 字符串均拒绝) |
+
+JWS 结构(`BASE64URL(header) . BASE64URL(payload) . BASE64URL(signature)`):
+
+- **头部**:对象且**仅含**两个字段 —— `"alg": "EdDSA"` 与非空字符串 `"kid"`。
+- **载荷**:对象且**仅含**三个字段 —— 整数 `nbf`、整数 `exp`、`rules`(1~100 条,格式与校验同召回核验,`id` 唯一)。
+- **签名**:对**原始前两段以点连接后的字节**(`b"头.载荷"`,不重新编码)做 Ed25519 签名。
+- 头部、载荷及每条规则的 JSON 在**任意嵌套层出现重复键**均按格式非法拒绝。
+
+服务端校验顺序(全部通过才返回结果):
+
+1. JWS 三段结构、base64url、头部与载荷形状、`nbf` / `exp` / `rules` 类型 —— 格式非法返回 **422**。
+2. 用头部 `kid` 从本地信任文件查 Ed25519 公钥 —— 未知 kid 返回 **403**。
+3. 验 Ed25519 签名 —— 签名失败返回 **403**。
+4. 载荷 `rules` 按现有规则格式校验(GTIN 校验位、日期区间、`id` 唯一等)—— 非法返回 **422**。
+5. 时间窗 `nbf ≤ now < exp`(左闭右开)—— 越期返回 **403**。
+6. 每条规则的 GTIN 至少匹配该 kid 授权的一个 **GTIN 前缀**(1~14 位数字,按前缀比较)—— 任一规则越权返回 **403**。
+
+> 验签通过后,规则格式校验(422)先于时间窗与前缀授权(403):非法规则无论是否过期、越权都报 422。无论 422 还是 403,响应中都**不返回匹配结果**。
+
+响应(200):
+
+```json
+{
+  "kid": "demo-recall-2026",
+  "results": [
+    {
+      "index": 0,
+      "ok": true,
+      "fields": {
+        "gtin": "09506001123454",
+        "batch": "LOT1",
+        "serial": "SN9",
+        "date": "2025-12-31"
+      },
+      "matches": ["recall-2026-001"],
+      "error": null
+    }
+  ]
+}
+```
+
+`results` 与 `/v1/recall/check` 完全一致(单条扫描解析失败不影响其余条目);`kid` 为验签通过的密钥 ID。
+
+示例(先运行 `python scripts/generate_sample_jws.py` 生成信任文件与样例):
+
+```bash
+curl -s http://localhost:8000/v1/recall/check-signed \
+  -H 'Content-Type: application/json' \
+  -d @examples/signed-check.json
+```
+
+### 本地信任文件与样例脚本
+
+信任文件路径由环境变量 **`GS1_TRUST_FILE`** 指定,缺省为工作目录下的 `trust.json`(Compose 已把仓库根的 `trust.json` **只读挂载**到容器内 `/srv/app/trust.json`,`docker compose up --build` 单命令即可用)。格式:
+
+```json
+{
+  "keys": [
+    {
+      "kid": "demo-recall-2026",
+      "public_key": "u8XJwMNevzUuVq0iYCxWR7j5A8VwnPEOVaSgyuJjfKQ",
+      "gtin_prefixes": ["0950600"]
+    }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `kid` | 非空字符串,信任文件内唯一,与 JWS 头部 `kid` 对应 |
+| `public_key` | Ed25519 **32 字节原始公钥**的无填充 base64url |
+| `gtin_prefixes` | 非空数组,每项 1~14 位数字;规则 GTIN 命中其中任一前缀(前缀比较)才算授权 |
+
+信任文件缺失或损坏时接口返回 **500**(运维问题,不属请求格式或授权范畴)。
+
+`scripts/generate_sample_jws.py` 生成本地样例:
+
+```bash
+python scripts/generate_sample_jws.py                    # 默认固定演示密钥(幂等)
+python scripts/generate_sample_jws.py --random-key       # 随机密钥
+python scripts/generate_sample_jws.py --kid my-key \
+    --gtin-prefix 0950600 --gtin-prefix 088              # 多个授权前缀
+python scripts/generate_sample_jws.py --now 1780000000 --ttl 3600
+```
+
+产物为 `trust.json`(公钥与授权前缀)与 `examples/signed-check.json`(可直接 POST 的请求体,含以当前时间为 `now` 的 JWS),并打印 curl 命令。
+
+> 仓库自带的 `trust.json` 与脚本默认密钥来自**固定演示种子**,仅用于本地开发;生产请用 `--random-key`(或自行保管的签发密钥),私钥离线保管,信任文件只放公钥与授权前缀。
 
 ### `POST /v1/recall/rule-relations`
 
@@ -417,12 +527,19 @@ app/
   gs1.py       # GS1 扫描串解析(AI 01/10/17/21、FNC1、]d2、校验位、日期)
   models.py    # 请求 / 响应模型与规则校验
   matcher.py   # 召回规则匹配
+  signed.py    # 签名召回核验(compact JWS / Ed25519 验签、本地信任文件、时间窗与 GTIN 前缀授权)
   relations.py # 召回规则关系分析(命中集合比较与证据扫描串构造)
   custody.py   # 实物交接审计(按时间重放事件,维护持有人)
   packing.py   # 装拆包装审计(按输入顺序重放装/拆操作,维护父子关系)
   isolation.py # 召回隔离计划(命中实物沿最终父链归并到最高层已封签祖先)
+scripts/
+  generate_sample_jws.py  # 本地样例:Ed25519 密钥、信任文件 trust.json 与 JWS 请求样例
+examples/
+  signed-check.json       # 可直接 POST 到 /v1/recall/check-signed 的请求体样例
+trust.json                # 本地信任文件(演示公钥 + 授权 GTIN 前缀;Compose 只读挂载)
 tests/
   test_recall.py
+  test_signed.py
   test_relations.py
   test_custody.py
   test_packing.py

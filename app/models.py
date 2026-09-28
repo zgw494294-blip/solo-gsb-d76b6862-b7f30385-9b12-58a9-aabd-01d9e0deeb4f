@@ -6,7 +6,7 @@ from datetime import date as dt_date
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from .gs1 import VARIABLE_MAX, gtin_check_ok
 
@@ -100,6 +100,24 @@ class ScanResult(BaseModel):
 
 class CheckResponse(BaseModel):
     results: list[ScanResult]
+
+
+# ---------- 签名召回核验 (/v1/recall/check-signed) ----------
+
+
+class SignedCheckRequest(BaseModel):
+    """签名核验请求:现有 scans + compact JWS(头部 + 内含 rules 的载荷 + 签名)+ now。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scans: list[str] = Field(min_length=1, max_length=100)
+    jws: str = Field(min_length=1)  # compact JWS,三段无填充 base64url
+    now: StrictInt  # Unix 秒;StrictInt 拒绝 bool/float/字符串
+
+
+class SignedCheckResponse(BaseModel):
+    kid: str  # 验签通过的密钥 ID
+    results: list[ScanResult]  # 与 /v1/recall/check 一致的原扫码核验结果
 
 
 # ---------- 实物交接审计 (/v1/custody/audit) ----------

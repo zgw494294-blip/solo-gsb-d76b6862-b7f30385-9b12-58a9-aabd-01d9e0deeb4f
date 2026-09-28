@@ -1,0 +1,11 @@
+{
+  "keys": [
+    {
+      "kid": "demo-recall-2026",
+      "public_key": "u8XJwMNevzUuVq0iYCxWR7j5A8VwnPEOVaSgyuJjfKQ",
+      "gtin_prefixes": [
+        "0950600"
+      ]
+    }
+  ]
+}

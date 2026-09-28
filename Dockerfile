@@ -10,6 +10,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# 本地样例信任文件(公钥 + 授权 GTIN 前缀);生产请用挂载覆盖,见 docker-compose.yml
+COPY trust.json ./trust.json
+
 RUN useradd --system --uid 10001 appuser
 USER appuser
 

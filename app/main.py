@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from .custody import audit_custody
 from .gs1 import ScanParseError, parse_scan
@@ -22,14 +22,22 @@ from .models import (
     ScanErrorBody,
     ScanFields,
     ScanResult,
+    SignedCheckRequest,
+    SignedCheckResponse,
 )
 from .packing import audit_packing
 from .relations import analyze_rule_relations
+from .signed import (
+    SignedForbiddenError,
+    SignedFormatError,
+    TrustFileError,
+    verify_signed_check,
+)
 
 app = FastAPI(
     title="GS1 扫码核验 API",
-    version="1.4.0",
-    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、规则关系分析、实物交接重放、装拆包装审计与召回隔离计划",
+    version="1.5.0",
+    summary="解析 GS1 扫描串(AI 01/10/17/21):召回规则匹配、签名召回核验、规则关系分析、实物交接重放、装拆包装审计与召回隔离计划",
 )
 
 
@@ -68,6 +76,27 @@ def recall_check(request: CheckRequest) -> CheckResponse:
             )
         )
     return CheckResponse(results=results)
+
+
+@app.post(
+    "/v1/recall/check-signed", response_model=SignedCheckResponse, tags=["recall"]
+)
+def recall_check_signed(request: SignedCheckRequest) -> SignedCheckResponse:
+    """校验 compact JWS(Ed25519):本地信任文件查公钥、时间窗与 GTIN 前缀授权全部
+    通过后,执行与 /v1/recall/check 一致的扫码核验并返回 kid 与结果。
+
+    JWS 或载荷规则格式非法返回 422;未知密钥、签名失败、越期或越权返回 403,
+    均不返回匹配结果。
+    """
+    try:
+        kid, check = verify_signed_check(request.scans, request.jws, request.now)
+    except SignedFormatError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except SignedForbiddenError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except TrustFileError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return SignedCheckResponse(kid=kid, results=check.results)
 
 
 @app.post("/v1/custody/audit", response_model=CustodyAuditResponse, tags=["custody"])
